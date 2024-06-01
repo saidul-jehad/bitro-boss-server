@@ -2,6 +2,7 @@ const express = require('express')
 const app = express();
 const cors = require("cors")
 const jwt = require('jsonwebtoken')
+const stripe = require('stripe')("sk_test_51PLWnLB7d9Q4SFII9P0b1hdExAR2ucQ7cX2I3uJwJvcsNXFOlRo1Bgvdq8YWzKMEwYasXT5xcf967bf7KkLQ3nwk00nq6JHS5s")
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config()
 const port = process.env.PORT || 5000;
@@ -18,8 +19,6 @@ app.use(
     })
 );
 app.use(express.json())
-
-
 
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.ujjqksd.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
@@ -42,16 +41,17 @@ async function run() {
         const menuCollection = client.db("bistroDb").collection("menu");
         const reviewsCollection = client.db("bistroDb").collection("reviews");
         const cartsCollection = client.db("bistroDb").collection("carts");
+        const paymentsCollection = client.db("bistroDb").collection("payments");
 
 
         // oun middleWare
         const verifyToken = async (req, res, next) => {
-            const token = req.headers.authorization.split(' ')[1];
+            const token = req?.headers?.authorization?.split(' ')[1];
 
             if (!token) {
                 return res.status(401).send({ message: "unauthorized access" })
             }
-            console.log(token);
+            // console.log(token);
             jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
                 if (err) {
                     console.log("err");
@@ -95,12 +95,13 @@ async function run() {
 
         app.get('/users/admin/:email', verifyToken, async (req, res) => {
             const email = req.params.email
+
             if (email !== req?.decoded?.email) {
                 return res
                     .status(403)
                     .send({ message: "forbidden access" })
             }
-            const query = { email: req.decoded.email }
+            const query = { email: email }
             const user = await userCollection.findOne(query)
 
             let admin = false
@@ -143,9 +144,48 @@ async function run() {
 
 
 
-        // menu collection
+        // menu related api
         app.get('/menu', async (req, res) => {
             const result = await menuCollection.find().toArray()
+            res.send(result)
+        })
+
+        app.get('/menu/:id', async (req, res) => {
+            const id = req.params.id
+            const query = { _id: id }
+            const result = await menuCollection.findOne(query)
+            res.send(result)
+        })
+
+        app.post('/menu', verifyToken, verifyAdmin, async (req, res) => {
+            const menuItem = req.body
+            const result = await menuCollection.insertOne(menuItem)
+            res.send(result)
+
+        })
+
+        app.patch('/menu/:id', async (req, res) => {
+            const id = req.params.id
+            const item = req.body
+            const query = { _id: id }
+            const updatedDoc = {
+                $set: {
+                    name: item.name,
+                    recipe: item.recipe,
+                    image: item.image,
+                    price: item.price,
+                    category: item.category,
+                }
+            }
+
+            const result = await menuCollection.updateOne(query, updatedDoc)
+            res.send(result)
+        })
+
+        app.delete('/menu/:id', verifyToken, verifyAdmin, async (req, res) => {
+            const id = req.params.id
+            const query = { _id: new ObjectId(id) }
+            const result = await menuCollection.deleteOne(query)
             res.send(result)
         })
 
@@ -156,7 +196,7 @@ async function run() {
         })
 
 
-        // cartsCollection
+        // cart related api
         app.get('/carts', async (req, res) => {
             const email = req.query.email
             const query = { email: email }
@@ -175,6 +215,85 @@ async function run() {
             const query = { _id: new ObjectId(id) }
             const result = await cartsCollection.deleteOne(query)
             res.send(result)
+        })
+
+        // payment related
+        app.post('/create-payment-intent', async (req, res) => {
+            const { price } = req.body
+            const amount = parseInt(price * 100)
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: amount,
+                currency: 'usd',
+                "payment_method_types": [
+                    "card"
+                ],
+            })
+
+            res.send({
+                clientSecret: paymentIntent.client_secret
+            })
+        })
+
+        app.get('/payments/:email', verifyToken, async (req, res) => {
+            const email = req.params.email
+            console.log(email);
+            if (email !== req?.decoded?.email) {
+                return res
+                    .status(403)
+                    .send({ message: "forbidden access" })
+            }
+
+            const query = { email: email }
+            const result = await paymentsCollection.find(query).toArray()
+            res.send(result)
+        })
+
+
+        app.post('/payments', async (req, res) => {
+            const payment = req.body
+            console.log('payment info ', payment);
+            const paymentResult = await paymentsCollection.insertOne(payment)
+
+            //  carefully delete each item from the cart
+            const query = {
+                _id: {
+                    $in: payment.cartIds.map(id => new ObjectId(id))
+                }
+            }
+            const deleteResult = await cartsCollection.deleteMany(query)
+            res.send({ paymentResult, deleteResult })
+        })
+
+
+        // stats and analytics
+        app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
+            const users = await userCollection.estimatedDocumentCount()
+            const menuItems = await menuCollection.estimatedDocumentCount()
+            const orders = await paymentsCollection.estimatedDocumentCount()
+
+            // this is not best wye
+            // const payments = await paymentsCollection.find().toArray()
+            // const revenue = payments.reduce((total, payment) => total + payment.price, 0)
+
+            const result = await paymentsCollection.aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalRevenue: {
+                            $sum: '$price'
+                        }
+                    }
+                }
+            ]).toArray()
+
+            const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+            res.send({
+                users,
+                menuItems,
+                orders,
+                revenue
+            })
         })
 
 
